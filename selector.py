@@ -11,7 +11,7 @@ import re
 import sys
 
 DATA = os.environ.get("DATA_DIR", "/data")
-MAP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map")
+MAP = os.environ.get("BLAST_MAP") or os.path.join(os.path.dirname(os.path.abspath(__file__)), "map")
 WORKER_MS = 2000
 MAX_WORKERS = 8
 CONFIG_FILES = {"pyproject.toml", "setup.cfg", "setup.py", "pytest.ini", "tox.ini", "conftest.py"}
@@ -196,10 +196,10 @@ def split(tests, ms):
 SRC = os.environ.get("BLAST_SRC", "/app/src")
 # Cost model for running a test here, in CPU milliseconds, from its recorded seconds.
 RHO = float(os.environ.get("BLAST_RHO", "1.5"))  # CPU per recorded second, cold process
-POOL_RHO = 3.0  # tests that fan out to a process pool were recorded with several workers
+POOL_RHO = 2.5  # tests that fan out to a process pool were recorded with several workers
 RUN_OVERHEAD_MS = 400  # fork + import of sqlglot and one test module
 HEAVY_IMPORT_MS = 600  # test modules that import duckdb/pandas
-POOL_MS = 1500  # starting the pool's worker process
+POOL_MS = 300  # pickling work to and from the pool
 FIXTURE_MS = {"tests/test_executor.py::TestExecutor": 2500}  # setUpClass loading the TPC tables
 KEEP = 0.8  # run only when the estimated CPU is below this share of what a clean run saves
 BUDGET_S = float(os.environ.get("BLAST_BUDGET", "110"))  # wall seconds for all runs together
@@ -218,6 +218,7 @@ LABEL_EXPENSIVE = ()
 VERBOSE = os.environ.get("BLAST_VERBOSE") == "1"
 NO_RUN = os.environ.get("BLAST_NORUN") == "1"
 GATE = os.environ.get("BLAST_NOGATE") != "1"
+INLINE_POOL = os.environ.get("BLAST_REALPOOL") != "1"
 FULL = os.environ.get("BLAST_FULL") == "1"  # validation: run every covering test to the end
 LABEL = os.environ.get("BLAST_LABEL") == "1"  # validation: also the expensive tests, last
 LABEL_ALL = os.environ.get("BLAST_LABEL_ALL") == "1"  # validation: never stop early
@@ -324,6 +325,50 @@ def child_main(wfd, ov, order, probe):
 
     def say(s):
         os.write(wfd, (s + "\n").encode())
+
+    if INLINE_POOL:
+        # Tests that fan work out to a ProcessPoolExecutor get the same work done in this
+        # process: same function, same pickling of arguments and results, no worker start-up.
+        import concurrent.futures as cf
+        import concurrent.futures.process as cfp
+        import pickle
+
+        class InlinePool:
+            def __init__(self, max_workers=None, mp_context=None, initializer=None, initargs=(), **kw):
+                self._init = (initializer, initargs)
+                self._started = False
+
+            def _start(self):
+                if not self._started:
+                    self._started = True
+                    initializer, initargs = self._init
+                    if initializer is not None:
+                        initializer(*pickle.loads(pickle.dumps(initargs)))
+
+            def submit(self, fn, /, *args, **kwargs):
+                f = cf.Future()
+                try:
+                    self._start()
+                    fn2, a2, k2 = pickle.loads(pickle.dumps((fn, args, kwargs)))
+                    f.set_result(pickle.loads(pickle.dumps(fn2(*a2, **k2))))
+                except Exception as e:
+                    f.set_exception(e)
+                return f
+
+            def map(self, fn, *iterables, timeout=None, chunksize=1):
+                fs = [self.submit(fn, *a) for a in zip(*iterables)]
+                return (f.result() for f in fs)
+
+            def shutdown(self, wait=True, *, cancel_futures=False):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        cf.ProcessPoolExecutor = cfp.ProcessPoolExecutor = InlinePool
 
     if probe:
         try:
@@ -541,6 +586,8 @@ def plan_run(sel, ms, ctx):
         if sum(ms[t] for t in order) > LABEL_MAX_MS:
             return [], False
         if LABEL_ALL:
+            if os.environ.get("BLAST_LABEL_NOEXP") == "1":
+                return order, False
             return order + sorted((t for t in kept if t in gated), key=lambda t: ms[t]), False
         return order + sorted((t for t in kept if ms[t] < 25000), key=lambda t: ms[t]), False
     if FULL:

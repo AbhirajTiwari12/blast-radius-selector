@@ -82,6 +82,11 @@ Safety nets, all falling back to the static selection or to something larger:
 - a class or module fixture fails, the child dies or exceeds its time allowance, or the
   global time budget is spent: nothing is removed.
 
+Two things differ from a pytest run, both only in how the same work is scheduled: the child
+is pinned to one core, and a test that submits work to a `ProcessPoolExecutor` gets it done
+in the child itself (same function, arguments and results pickled as a pool would), so no
+worker process has to start and import everything again.
+
 The child's stdout and stderr go to `/dev/null`; only the JSON lines reach stdout.
 
 ## Rebuilding the maps
