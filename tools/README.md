@@ -20,6 +20,9 @@ Maps are built in the labeling image (`python:3.13-slim` at the digest in the Do
    (parse, pickle round trip, execute, compare, plus the shared import and fixture work) and
    records what each query costs.
 
+5. `trace_files.py` runs the suite once with an audit hook and records which tests list a
+   directory or open a file of the checkout outside the import system (`map/dirs.json`).
+
 `measure_cpu.py` measures the CPU a test costs when run by the selector (used to choose the
 constants of the cost model in `selector.py`).
 

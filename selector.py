@@ -138,6 +138,52 @@ def py_tests(rel, lines, selected):
         i = j
 
 
+_dirs = {}
+
+
+def dir_map():
+    """Tests that list a directory, and tests that read a python file as data."""
+    if not _dirs:
+        with open(os.path.join(MAP, "ids.json")) as f:
+            idx = {t: i for i, t in enumerate(json.load(f))}
+        try:
+            with open(os.path.join(MAP, "dirs.json")) as f:
+                d = json.load(f)
+        except OSError:
+            d = {"lists": {}, "reads": {}}
+        for kind in ("lists", "reads"):
+            _dirs[kind] = {k: {idx[t] for t in v if t in idx} for k, v in d[kind].items()}
+    return _dirs
+
+
+def pytest_config_changed(f, rel):
+    """False only when the patch provably leaves pytest's configuration alone: a root
+    pyproject.toml / setup.cfg / tox.ini without a pytest section before and after, or a
+    setup.py (pytest never reads it; a test that does is in the read map)."""
+    base = rel.rsplit("/", 1)[-1]
+    if base == "setup.py":
+        return False
+    if "/" in rel or base in ("conftest.py", "pytest.ini"):
+        return True
+    marks = {"pyproject.toml": ("[tool.pytest",), "setup.cfg": ("[tool:pytest]", "[pytest]"), "tox.ini": ("[pytest]", "[tool:pytest]")}[base]
+    try:
+        if not os.path.isdir(os.path.join(SRC, "sqlglot")):
+            return True
+        text = ""
+        if f["old"]:
+            with open(os.path.join(SRC, f["old"]), encoding="utf-8") as fh:
+                text = fh.read()
+        texts = [text]
+        if f["new"]:
+            after = apply_patch(f, text)
+            if after is None:
+                return True
+            texts.append(after)
+        return any(m in t for t in texts for m in marks)
+    except Exception:
+        return True
+
+
 def select(patch_text, fixtures, all_tests):
     selected = set()
     for f in parse_patch(patch_text):
@@ -147,18 +193,29 @@ def select(patch_text, fixtures, all_tests):
             continue
         base = rel.rsplit("/", 1)[-1]
         renamed = old and new and old != new
-        if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/") or base in CONFIG_FILES):
-            m = load_file(rel)
-            if base == "conftest.py" or (m is None and base in CONFIG_FILES):
+        dm = dir_map()
+        if old is None or new is None or renamed:
+            # a file appears or disappears: tests that list its directory see that
+            for path in (old, new):
+                if path:
+                    selected.update(dm["lists"].get(path.rpartition("/")[0], ()))
+        for path in (old, new):
+            if path:  # tests that read this python file as text
+                selected.update(dm["reads"].get(path, ()))
+        if base in CONFIG_FILES:
+            if pytest_config_changed(f, rel):
                 return set(all_tests)
+            continue
+        if new and re.match(r"[^/]+\.py$|[^/]+/__init__\.py$", new) and (old is None or renamed):
+            return set(all_tests)  # a new top-level module can shadow any import
+        if rel.endswith(".py") and (rel.startswith("sqlglot/") or rel.startswith("tests/")):
+            m = load_file(rel)
             if new is None or renamed or old is None:
                 # deleted / moved / new module: everyone importing it (if anyone)
                 if m:
                     selected.update(m["all"])
                 continue
             py_tests(rel, f["lines"], selected)
-        elif base in CONFIG_FILES:
-            return set(all_tests)
         elif rel in fixtures:
             selected.update(fixtures[rel])
         elif old and new and renamed and old in fixtures:
@@ -793,7 +850,14 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
     if extra:
         return sorted(set(sel) | extra)
     if unchanged == len(files):
-        return []  # every edited file compiles to exactly the code it had
+        # every edited file compiles to exactly the code it had: only tests that read one of
+        # these files as text can tell (they are run below like any other covering test)
+        readers = set()
+        for rel in files:
+            readers.update(ctx["readers"](rel))
+        sel = [t for t in sel if t in readers]
+        if not sel:
+            return []
     if NO_RUN or time.monotonic() > deadline:
         return sel
     test_by_num, preload = ctx["tests"], ctx["preload"]
@@ -934,9 +998,12 @@ def main():
                     m = load_file(rel)
                     return {number[ids[i]] for i in (m["all"] if m else ()) if ids[i] in number}
 
+                def readers(rel):
+                    return {number[ids[i]] for i in dir_map()["reads"].get(rel, ()) if ids[i] in number}
+
                 ctx = {
                     "preload": preload, "pool": pool, "tests": test_by_num, "importers": importers,
-                    "units": units, "run_ms": ms, "heavy_state": {}, "cal": {"act": 4000.0, "est": 4000.0},
+                    "units": units, "run_ms": ms, "heavy_state": {}, "readers": readers, "cal": {"act": 4000.0, "est": 4000.0},
                     "never": {t for t in ms if ms[t] >= EXPENSIVE_MS},
                     "gated": {number[i] for i in GATED if i in number},
                 }

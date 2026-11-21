@@ -16,6 +16,9 @@ tests on the patched code while deciding.
   the module, class-level lines to the tests that use the class;
 - the non-Python files under `tests/` that each test opens are recorded, so a fixture maps
   to the tests that read it;
+- which tests list a directory of the checkout or read one of its python files as text
+  (`dirs.json`): a file added to or removed from such a directory, or any edit of such a
+  file, selects them;
 - which tests hand work to a process pool (`procs.json`), which library modules the
   test files import (`preload.json`), and which tests loop over independent units
   (`units.json`).
@@ -23,6 +26,11 @@ tests on the patched code while deciding.
 `selector.py` parses each diff and maps its changed lines through those maps (a changed line
 stands for its whole statement; a function signature stands for its body; an inserted line
 stands for its neighbours). That gives the covering tests: a superset of what can fail.
+
+Configuration files: `conftest.py`, `pytest.ini`, or a `pyproject.toml` / `setup.cfg` /
+`tox.ini` that has a pytest section before or after the patch select every test; without a
+pytest section they select none (the suite is run from the checkout, not from an installed
+package). A new top-level module or package selects every test, since it can shadow an import.
 
 ## 2. Run to decide (executing the patched code)
 
