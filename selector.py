@@ -206,6 +206,7 @@ BUDGET_S = float(os.environ.get("BLAST_BUDGET", "110"))  # wall seconds for all 
 # Tests too expensive to ever run here (recorded seconds): kept whenever the map selects them,
 # except under the evidence rule below.
 EXPENSIVE_MS = 3600
+LOOP_MAX_MS = 6000  # a unit-restricted run may cost up to this much (recorded-ms scale)
 # Evidence rule: these tests replay whole TPC query sets through the optimizer, planner and
 # executor. When every other covering test was run on the patched code and passed, they are
 # left out. Measured on generated mutants (tools/README.md): see README for the numbers.
@@ -383,9 +384,8 @@ def child_main(wfd, ov, order, probe):
         try:
             mod = importlib.import_module(file[:-3].replace("/", "."))
             case = getattr(mod, cls)(meth)
-            if attr:  # the test loops over an Enum in its module: restrict the loop
-                enum = getattr(mod, attr)
-                case._blast_loop = (mod, attr, enum, [enum[u] for u in units])
+            if attr:  # the test loops over units: restrict the loop to some of them
+                case._blast_loop = (attr, units)
         except BaseException:
             if os.environ.get("BLAST_DEBUG"):
                 import traceback
@@ -401,7 +401,17 @@ def child_main(wfd, ov, order, probe):
             self._bad = False
             loop = getattr(test, "_blast_loop", None)
             if loop:
-                setattr(loop[0], loop[1], loop[3])
+                (where, attr), units = loop
+                if where == "module":  # an Enum in the test's module, units are member names
+                    holder = sys.modules[type(test).__module__]
+                    full = getattr(holder, attr)
+                    part = [full[u] for u in units]
+                else:  # a list on the test class (made by its fixture), units are positions
+                    holder = type(test)
+                    full = getattr(holder, attr)
+                    part = [full[int(u)] for u in units]
+                self._loop = (holder, attr, full)
+                setattr(holder, attr, part)
             # what pytest does around every test
             self._cw = warnings.catch_warnings(record=True)
             self._cw.__enter__()
@@ -409,9 +419,9 @@ def child_main(wfd, ov, order, probe):
             warnings.filterwarnings("always", category=PendingDeprecationWarning)
 
         def stopTest(self, test):
-            loop = getattr(test, "_blast_loop", None)
-            if loop:
-                setattr(loop[0], loop[1], loop[2])
+            if getattr(test, "_blast_loop", None) and getattr(self, "_loop", None):
+                setattr(*self._loop)
+                self._loop = None
             self._cw.__exit__(None, None, None)
             super().stopTest(test)
             say("%d %d" % (test._blast_i, 1 if self._bad else 0))
@@ -597,8 +607,10 @@ def plan_run(sel, ms, ctx):
     best, best_gain, best_gate = 0, 0, False
     step = max(1, len(order) // 40)
     for k in range(1, len(order) + 1):
-        if k < len(order) and (run_ms[order[k]] == run_ms[order[k - 1]] or k % step):
-            continue
+        if k < len(order) and run_ms[order[k - 1]] == ms[order[k - 1]] and (
+            run_ms[order[k]] == run_ms[order[k - 1]] or k % step
+        ):
+            continue  # (prefixes ending in a unit-restricted test are always considered)
         gain = KEEP * (base - static_cost(order[k:] + kept, ms)) - scale * est_cpu_ms(order[:k], ms, ctx)
         if gain > best_gain:
             best, best_gain = k, gain
@@ -793,10 +805,13 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
     for t, hit in units_hit.items():
         spec = ctx["units"].get(t)
         if spec and hit and t in sel and set(hit) <= set(spec["units"]):
-            share = round(ms[t] * len(hit) / len(spec["units"]))
-            if share < EXPENSIVE_MS and len(hit) < len(spec["units"]):
+            if "ms" in spec:  # measured cost of each unit
+                share = sum(spec["ms"].get(u, 0) for u in hit)
+            else:
+                share = round(ms[t] * len(hit) / len(spec["units"]))
+            if share < LOOP_MAX_MS:
                 run_ms[t] = share
-                loops[t] = (spec["attr"], sorted(hit))
+                loops[t] = ((spec.get("on", "module"), spec["attr"]), sorted(hit))
     ctx["never"] = never = {t for t in ctx["never"] if t not in loops}
     if any(test_by_num[t]["file"] in preload["heavy"] for t in sel) and not heavy_ready(ctx):
         # duckdb/pandas cannot be loaded here: leave the tests that need them to the workers
@@ -815,7 +830,12 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
     run = [t for g in sorted(groups.values(), key=lambda g: (sum(run_ms[x] for x in g), g)) for t in g]
     if LABEL:
         run = [t for t in run if t not in never] + sorted((t for t in run if t in never), key=lambda t: ms[t])
-    run = [t for t in run if t not in loops] + [t for t in run if t in loops]
+    # unit-restricted tests go first (they settle the most expensive tests), followed by the
+    # rest of their own class so that its fixture is built once
+    first = [t for t in run if t in loops]
+    first_cls = {test_by_num[t]["id"].rsplit("::", 1)[0] for t in first}
+    same = [t for t in run if t not in loops and test_by_num[t]["id"].rsplit("::", 1)[0] in first_cls]
+    run = first + same + [t for t in run if t not in loops and t not in set(same)]
     order = [tuple(test_by_num[t]["id"].split("::")) + loops.get(t, (None, None)) for t in run]
     passed, failed = set(), set()
     state = {"rest": sum(run_ms[t] for t in run)}

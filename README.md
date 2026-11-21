@@ -47,18 +47,21 @@ run here (except unit-restricted, below).
 
 ### Tests that loop over units
 
-`TestGenerator::test_generator_memory` (6.7 s) runs the same body once per dialect, each in
-its own subtest. `map/units.json` names the Enum it loops over, and the coverage map holds
-one extra trace per dialect (the test run with the loop restricted to that dialect, on the
-pinned commit). When a change is covered by the test only through some dialects, the child
-runs the test's own code with the loop restricted to those dialects, which costs that share
-of its time; if they pass, the test is dropped like any other test that was run and passed.
+Three expensive tests run one body once per unit, each in its own subtest:
+`TestGenerator::test_generator_memory` (6.7 s, one unit per dialect) and
+`TestExecutor::test_execute_tpcds` / `test_execute_tpch` (21 s / 4 s, one unit per fixture
+query). `map/units.json` names what each loops over (an Enum in the test module, a list on
+the test class), and the coverage map holds one extra trace per unit, taken on the pinned
+commit. A unit the change does not reach cannot change its outcome. When a change reaches
+only a few units, the child runs the test's own code with the loop restricted to those
+units, which costs that share of its time; if they pass, the test is dropped like any other
+test that was run and passed, and if one fails the test is kept.
 
 ### Evidence rule for the TPC executor tests
 
 `TestExecutor::test_execute_tpcds` (21 s) and `test_execute_tpch` (4 s) replay whole TPC
-query sets through parser, optimizer, planner and executor; they cost more CPU to run than
-they cost to keep. When one of them covers the change, the selector may instead run *every
+query sets through parser, optimizer, planner and executor; when a change reaches most of
+their queries they cost more CPU to run than they cost to keep. The selector may then run *every
 other* covering test on the patched code (only if that is cheap enough, and only if there
 are at least five). If any of them fails, nothing is dropped beyond the tests that passed.
 If all of them pass, the two TPC executor tests are left out as well.
