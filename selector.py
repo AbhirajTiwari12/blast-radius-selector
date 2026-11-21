@@ -258,7 +258,7 @@ RUN_OVERHEAD_MS = 400  # fork + import of sqlglot and one test module
 HEAVY_IMPORT_MS = 600  # test modules that import duckdb/pandas
 POOL_MS = 300  # pickling work to and from the pool
 FIXTURE_MS = {"tests/test_executor.py::TestExecutor": 2500}  # setUpClass loading the TPC tables
-KEEP = 0.8  # run only when the estimated CPU is below this share of what a clean run saves
+KEEP = float(os.environ.get("BLAST_KEEP", "0.8"))  # run only when the estimated CPU is below this share of what a clean run saves
 BUDGET_S = float(os.environ.get("BLAST_BUDGET", "110"))  # wall seconds for all runs together
 # Tests too expensive to ever run here (recorded seconds): kept whenever the map selects them,
 # except under the evidence rule below.
@@ -458,17 +458,37 @@ def child_main(wfd, ov, order, probe):
             self._bad = False
             loop = getattr(test, "_blast_loop", None)
             if loop:
-                (where, attr), units = loop
+                spec, units = loop
+                where, attr = spec.get("on", "module"), spec["attr"]
+                self._loop = []
                 if where == "module":  # an Enum in the test's module, units are member names
                     holder = sys.modules[type(test).__module__]
                     full = getattr(holder, attr)
-                    part = [full[u] for u in units]
-                else:  # a list on the test class (made by its fixture), units are positions
+                    self._loop.append((holder, attr, full))
+                    setattr(holder, attr, [full[u] for u in units])
+                elif where == "class":  # a list on the test class (made by its fixture)
                     holder = type(test)
                     full = getattr(holder, attr)
-                    part = [full[int(u)] for u in units]
-                self._loop = (holder, attr, full)
-                setattr(holder, attr, part)
+                    self._loop.append((holder, attr, full))
+                    setattr(holder, attr, [full[int(u)] for u in units])
+                else:  # fixture loaders in the test's module: keep some shares of each file
+                    holder = sys.modules[type(test).__module__]
+                    n, keep = spec["n"], {int(u) for u in units}
+
+                    def make(orig):
+                        def loader(filename):
+                            items = list(orig(filename))
+                            for i, item in enumerate(items):
+                                if (i * n) // len(items) in keep:
+                                    yield item
+
+                        return loader
+
+                    for a in attr:
+                        if hasattr(holder, a):
+                            full = getattr(holder, a)
+                            self._loop.append((holder, a, full))
+                            setattr(holder, a, make(full))
             # what pytest does around every test
             self._cw = warnings.catch_warnings(record=True)
             self._cw.__enter__()
@@ -477,7 +497,8 @@ def child_main(wfd, ov, order, probe):
 
         def stopTest(self, test):
             if getattr(test, "_blast_loop", None) and getattr(self, "_loop", None):
-                setattr(*self._loop)
+                for saved in self._loop:
+                    setattr(*saved)
                 self._loop = None
             self._cw.__exit__(None, None, None)
             super().stopTest(test)
@@ -873,9 +894,9 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
                 share = sum(spec["ms"].get(u, 0) for u in hit)
             else:
                 share = round(ms[t] * len(hit) / len(spec["units"]))
-            if share < LOOP_MAX_MS:
-                run_ms[t] = share
-                loops[t] = ((spec.get("on", "module"), spec["attr"]), sorted(hit))
+            if share < LOOP_MAX_MS and (len(set(hit)) < len(spec["units"]) or ms[t] >= EXPENSIVE_MS):
+                run_ms[t] = min(share, ms[t])
+                loops[t] = (spec, sorted(set(hit)))
     ctx["never"] = never = {t for t in ctx["never"] if t not in loops}
     if any(test_by_num[t]["file"] in preload["heavy"] for t in sel) and not heavy_ready(ctx):
         # duckdb/pandas cannot be loaded here: leave the tests that need them to the workers

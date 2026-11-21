@@ -16,6 +16,8 @@ Maps are built in the labeling image (`python:3.13-slim` at the digest in the Do
    named `<test id>[<unit>]` (`build_map.py OUT1,OUT2 ...`). They are not tests of
    `tests.json`; the selector uses them only to tell which units a change reaches.
 
+   `trace_loader_units.py` does the same for tests that read their cases through the fixture
+   loaders (16 contiguous shares of each file's entries per test).
    For the TPC executor tests `trace_queries.py` traces every fixture query in one process
    (parse, pickle round trip, execute, compare, plus the shared import and fixture work) and
    records what each query costs.

@@ -55,12 +55,14 @@ run here (except unit-restricted, below).
 
 ### Tests that loop over units
 
-Three expensive tests run one body once per unit, each in its own subtest:
-`TestGenerator::test_generator_memory` (6.7 s, one unit per dialect) and
+Some tests run one body once per unit, each in its own subtest:
+`TestGenerator::test_generator_memory` (6.7 s, one unit per dialect),
 `TestExecutor::test_execute_tpcds` / `test_execute_tpch` (21 s / 4 s, one unit per fixture
-query). `map/units.json` names what each loops over (an Enum in the test module, a list on
-the test class), and the coverage map holds one extra trace per unit, taken on the pinned
-commit. A unit the change does not reach cannot change its outcome. When a change reaches
+query), and the twelve tests of 0.2 s or more that read their cases through the fixture
+loaders of `tests/helpers.py` (optimizer fixture files, `identity.sql`; a unit is one
+sixteenth of each file's entries). `map/units.json` names what each loops over (an Enum in
+the test module, a list on the test class, the fixture loaders), and the coverage map holds
+one extra trace per unit, taken on the pinned commit. A unit the change does not reach cannot change its outcome. When a change reaches
 only a few units, the child runs the test's own code with the loop restricted to those
 units, which costs that share of its time; if they pass, the test is dropped like any other
 test that was run and passed, and if one fails the test is kept.
