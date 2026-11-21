@@ -220,6 +220,7 @@ NO_RUN = os.environ.get("BLAST_NORUN") == "1"
 GATE = os.environ.get("BLAST_NOGATE") != "1"
 FULL = os.environ.get("BLAST_FULL") == "1"  # validation: run every covering test to the end
 LABEL = os.environ.get("BLAST_LABEL") == "1"  # validation: also the expensive tests, last
+LABEL_ALL = os.environ.get("BLAST_LABEL_ALL") == "1"  # validation: never stop early
 LABEL_MAX_MS = int(os.environ.get("BLAST_LABEL_MAX_MS", "12000"))
 
 
@@ -475,6 +476,16 @@ def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=()):
             os.waitpid(pid, 0)
         except OSError:
             pass
+        # this process may be PID 1: collect orphaned grandchildren (pool workers) too
+        waits = 0
+        while waits < 10:
+            try:
+                got = os.waitpid(-1, os.WNOHANG)[0]
+            except OSError:
+                break  # no children left
+            if not got:
+                waits += 1
+                time.sleep(0.005)
         shutil.rmtree(ov, ignore_errors=True)
     return done, probed
 
@@ -498,6 +509,25 @@ def est_cpu_ms(run, ms, ctx):
     return cost + (POOL_MS if pooled else 0)
 
 
+def cpu_now_ms():
+    """CPU used so far by this container (cgroup), else by this process and its children."""
+    try:
+        with open("/sys/fs/cgroup/cpu.stat") as f:
+            for line in f:
+                if line.startswith("usage_usec"):
+                    return int(line.split()[1]) / 1000
+    except (OSError, ValueError):
+        pass
+    return sum(os.times()[:4]) * 1000
+
+
+def cpu_scale(ctx):
+    """Measured CPU of the runs so far over their estimates: the cost model corrects itself
+    to the machine it runs on (starts at 1 with the weight of a 4 s run)."""
+    cal = ctx["cal"]
+    return min(2.5, max(0.4, cal["act"] / cal["est"]))
+
+
 def plan_run(sel, ms, ctx):
     """(tests to run, gate). Cheapest-first prefix of the covering tests worth running: the
     CPU it costs must be clearly less than what dropping those tests saves if they all pass.
@@ -510,23 +540,26 @@ def plan_run(sel, ms, ctx):
     if LABEL:
         if sum(ms[t] for t in order) > LABEL_MAX_MS:
             return [], False
+        if LABEL_ALL:
+            return order + sorted((t for t in kept if t in gated), key=lambda t: ms[t]), False
         return order + sorted((t for t in kept if ms[t] < 25000), key=lambda t: ms[t]), False
     if FULL:
         return order, False
     base = static_cost(sel, ms)
+    scale = cpu_scale(ctx)
     best, best_gain, best_gate = 0, 0, False
     step = max(1, len(order) // 40)
     for k in range(1, len(order) + 1):
         if k < len(order) and (run_ms[order[k]] == run_ms[order[k - 1]] or k % step):
             continue
-        gain = KEEP * (base - static_cost(order[k:] + kept, ms)) - est_cpu_ms(order[:k], ms, ctx)
+        gain = KEEP * (base - static_cost(order[k:] + kept, ms)) - scale * est_cpu_ms(order[:k], ms, ctx)
         if gain > best_gain:
             best, best_gain = k, gain
     # the evidence rule needs every covering test below the expensive ones to be run
     complete = all(ms[t] >= EXPENSIVE_MS for t in kept)
     if GATE and complete and len(order) >= GATE_MIN_TESTS and any(t in gated for t in kept):
         left = [t for t in kept if t not in gated]
-        gain = KEEP * (base - static_cost(left, ms)) - est_cpu_ms(order, ms, ctx)
+        gain = KEEP * (base - static_cost(left, ms)) - scale * est_cpu_ms(order, ms, ctx)
         if gain > best_gain:
             best, best_gain, best_gate = len(order), gain, True
     return order[:best], best_gate
@@ -746,7 +779,7 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
         state["rest"] -= run_ms[t]
         (failed if bad else passed).add(t)
         if LABEL:  # stop at the first cheap failure; run every expensive test once reached
-            return t in never or not failed
+            return LABEL_ALL or t in never or not failed
         if FULL or not failed:
             return True
         # something fails: go on only while finishing costs less than it can still save
@@ -756,14 +789,18 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
 
     t1 = time.monotonic()
     c1 = os.times()
+    u1 = cpu_now_ms()
     done, probed = run_tests(cid, files, order, [run_ms[t] for t in run], on_result, deadline, probe)
+    if done and run and len(passed) + len(failed) == len(run):
+        ctx["cal"]["act"] += cpu_now_ms() - u1
+        ctx["cal"]["est"] += est_cpu_ms(run, ms, ctx)
     if LABEL:
         print("LABEL " + json.dumps({"c": cid, "sel": sel, "run": run, "passed": sorted(passed), "failed": sorted(failed), "done": done, "probed": probed}), file=sys.stderr)
     if VERBOSE:
         c2 = os.times()
         print("%s: cover %d (%.1fs) run %d (%.2fs rec, est %.1fs) gate %s passed %d failed %d done %s probe %s/%s wall %.2f cpu %.2f" % (
             cid, len(sel), static_cost(sel, ms) / 1000, len(run), sum(run_ms[t] for t in run) / 1000, est_cpu_ms(run, ms, ctx) / 1000,
-            "%s loops %s" % (gate, sorted(len(v[1]) for v in loops.values())),
+            "%s scale %.2f loops %s" % (gate, cpu_scale(ctx), sorted(len(v[1]) for v in loops.values())),
             len(passed), len(failed), done, probe, probed, time.monotonic() - t1, c2[2] + c2[3] - c1[2] - c1[3]), file=sys.stderr)
     if not probed:
         # a patched module does not import (or hangs): every test that loads it fails
@@ -813,7 +850,8 @@ def main():
     ctx = None
     deadline = t0 + BUDGET_S
     have_src = os.path.isdir(os.path.join(SRC, "sqlglot"))
-    for name in names:
+    # smallest covering sets first: the cost model is calibrated before the big decisions
+    for name in sorted(names, key=lambda n: (sum(ms[t] for t in static[n]), n)):
         if name not in texts or not have_src:
             continue
         try:
@@ -831,7 +869,7 @@ def main():
 
                 ctx = {
                     "preload": preload, "pool": pool, "tests": test_by_num, "importers": importers,
-                    "units": units, "run_ms": ms, "heavy_state": {},
+                    "units": units, "run_ms": ms, "heavy_state": {}, "cal": {"act": 4000.0, "est": 4000.0},
                     "never": {t for t in ms if ms[t] >= EXPENSIVE_MS},
                     "gated": {number[i] for i in GATED if i in number},
                 }

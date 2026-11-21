@@ -39,7 +39,9 @@ For a patch that edits files under `sqlglot/` or `tests/` in place, the selector
 
 Which tests are run is a cost decision: CPU time is charged, so a test is run only when the
 CPU it is expected to cost is clearly less than what leaving it out of the answer saves.
-Tests that are not run stay in the answer. A run stops at the first failure unless
+The estimate comes from the recorded seconds and is corrected as the batch goes by the CPU
+the runs actually used (commits with the smallest covering sets go first), so the model
+adapts to the machine. Tests that are not run stay in the answer. A run stops at the first failure unless
 finishing is cheaper than what it can still save. Tests recorded at 3.6 s or more are never
 run here (except unit-restricted, below).
 
