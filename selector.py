@@ -252,12 +252,12 @@ def split(tests, ms):
 
 SRC = os.environ.get("BLAST_SRC", "/app/src")
 # Cost model for running a test here, in CPU milliseconds, from its recorded seconds.
-RHO = float(os.environ.get("BLAST_RHO", "1.5"))  # CPU per recorded second, cold process
-POOL_RHO = 2.5  # tests that fan out to a process pool were recorded with several workers
-RUN_OVERHEAD_MS = 400  # fork + import of sqlglot and one test module
-HEAVY_IMPORT_MS = 600  # test modules that import duckdb/pandas
-POOL_MS = 300  # pickling work to and from the pool
-FIXTURE_MS = {"tests/test_executor.py::TestExecutor": 2500}  # setUpClass loading the TPC tables
+RHO = float(os.environ.get("BLAST_RHO", "0.4"))  # CPU per recorded second, cold process
+POOL_RHO = 1.0  # tests that fan out to a process pool were recorded with several workers
+RUN_OVERHEAD_MS = 200  # fork + import of sqlglot and one test module
+HEAVY_IMPORT_MS = 150  # test modules that import duckdb/pandas
+POOL_MS = 100  # pickling work to and from the pool
+FIXTURE_MS = {"tests/test_executor.py::TestExecutor": 900}  # setUpClass loading the TPC tables
 KEEP = float(os.environ.get("BLAST_KEEP", "0.8"))  # run only when the estimated CPU is below this share of what a clean run saves
 BUDGET_S = float(os.environ.get("BLAST_BUDGET", "110"))  # wall seconds for all runs together
 # Tests too expensive to ever run here (recorded seconds): kept whenever the map selects them,
