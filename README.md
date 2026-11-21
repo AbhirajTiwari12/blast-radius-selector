@@ -50,8 +50,9 @@ CPU it is expected to cost is clearly less than what leaving it out of the answe
 The estimate comes from the recorded seconds and is corrected as the batch goes by the CPU
 the runs actually used (commits with the smallest covering sets go first), so the model
 adapts to the machine. Tests that are not run stay in the answer. A run stops at the first failure unless
-finishing is cheaper than what it can still save. Tests recorded at 3.6 s or more are never
-run here (except unit-restricted, below).
+finishing is cheaper than what it can still save. Tests recorded at 3.6 s or more are not run
+here, except unit-restricted (below) or when measured to cost less CPU than their recorded
+seconds (`map/cost.json`: `test_generator_memory`, `test_max_nodes`).
 
 ### Tests that loop over units
 
@@ -94,6 +95,15 @@ Safety nets, all falling back to the static selection or to something larger:
   that imports the file;
 - a class or module fixture fails, the child dies or exceeds its time allowance, or the
   global time budget is spent: nothing is removed.
+
+A class fixture is not built when it cannot matter: the trace of what importing the test
+module and running `TestExecutor.setUpClass` executes is one more unit of the map; when the
+change does not reach it, the fixture behaves as on the pinned commit, and when in addition
+none of the tests to run reads anything the fixture builds (`map/fixture_use.json`, from
+the test source), `setUpClass`/`tearDownClass` are skipped for that run.
+
+Tests are run one class at a time; classes whose tests are named after the edited file go
+first, so that a breaking change is usually caught by the first tests and the run stops.
 
 Two things differ from a pytest run, both only in how the same work is scheduled: the child
 is pinned to one core, and a test that submits work to a `ProcessPoolExecutor` gets it done

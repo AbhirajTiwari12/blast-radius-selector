@@ -25,6 +25,11 @@ Maps are built in the labeling image (`python:3.13-slim` at the digest in the Do
 5. `trace_files.py` runs the suite once with an audit hook and records which tests list a
    directory or open a file of the checkout outside the import system (`map/dirs.json`).
 
+6. `trace_fixture.py` traces what a class fixture executes (one more map entry,
+   `<class id>[fixture]`) and lists the tests that read what it builds
+   (`map/fixture_use.json`). `map/cost.json`: CPU milliseconds measured for the expensive
+   tests that are cheaper to run here than their recorded seconds.
+
 `measure_cpu.py` measures the CPU a test costs when run by the selector (used to choose the
 constants of the cost model in `selector.py`).
 

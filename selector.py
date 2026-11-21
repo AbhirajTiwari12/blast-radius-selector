@@ -274,9 +274,11 @@ GATED = (
 GATE_MIN_TESTS = 5  # need at least this many other covering tests as evidence
 LABEL_EXPENSIVE = ()
 VERBOSE = os.environ.get("BLAST_VERBOSE") == "1"
+TIMES = os.environ.get("BLAST_TIMES") == "1"
 NO_RUN = os.environ.get("BLAST_NORUN") == "1"
 GATE = os.environ.get("BLAST_NOGATE") != "1"
 INLINE_POOL = os.environ.get("BLAST_REALPOOL") != "1"
+SKIP_FIXTURES = os.environ.get("BLAST_ALLFIXTURES") != "1"
 FULL = os.environ.get("BLAST_FULL") == "1"  # validation: run every covering test to the end
 LABEL = os.environ.get("BLAST_LABEL") == "1"  # validation: also the expensive tests, last
 LABEL_ALL = os.environ.get("BLAST_LABEL_ALL") == "1"  # validation: never stop early
@@ -360,7 +362,7 @@ def make_overlay(ov, files):
             fh.write(text)
 
 
-def child_main(wfd, ov, order, probe):
+def child_main(wfd, ov, order, probe, skip_fixture=()):
     """In the forked child: import the patched tree and run the tests, one status line each."""
     import importlib
     import unittest
@@ -452,6 +454,18 @@ def child_main(wfd, ov, order, probe):
         case._blast_i = i
         cases.append(case)
 
+    try:
+        for cid in skip_fixture:
+            # the change cannot reach this class fixture and no test to run reads what it
+            # builds: do not build it
+            f, c = cid.split("::")
+            k = getattr(importlib.import_module(f[:-3].replace("/", ".")), c)
+            k.setUpClass = classmethod(lambda cls: None)
+            k.tearDownClass = classmethod(lambda cls: None)
+    except BaseException:
+        say("X")
+        os._exit(0)
+
     class Result(unittest.TestResult):
         def startTest(self, test):
             super().startTest(test)
@@ -536,7 +550,7 @@ def child_main(wfd, ov, order, probe):
     os._exit(0)
 
 
-def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=()):
+def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=(), skip_fixture=()):
     """Fork, import the modules in `probe`, then run `order`, all on the patched tree. Calls
     on_result(i, failed) per finished test; it returns False to stop. Returns (ran everything
     asked, the probe modules imported)."""
@@ -553,7 +567,7 @@ def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=()):
     if pid == 0:
         try:
             os.close(r)
-            child_main(w, ov, order, probe)
+            child_main(w, ov, order, probe, skip_fixture)
         finally:
             os._exit(1)
     os.close(w)
@@ -564,7 +578,7 @@ def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=()):
     probed = not probe
     try:
         while alive:
-            allow = max(12.0, 15 * expect_ms[nxt] / 1000) if nxt < len(order) else 12.0
+            allow = min(120.0, max(12.0, 15 * expect_ms[nxt] / 1000)) if nxt < len(order) else 12.0
             if LABEL:
                 allow = max(240.0, allow * 4)
             allow = min(allow, max(0.0, deadline - time.monotonic()))
@@ -623,6 +637,18 @@ def run_tests(cid, files, order, expect_ms, on_result, deadline, probe=()):
     return done, probed
 
 
+def fixtures_to_skip(run, ctx):
+    """Class fixtures that need not be built for this run: the change does not reach what the
+    fixture executes (its trace is a unit of the map) and none of the tests to run reads
+    what it builds."""
+    free = ctx.get("fixture_free") or ()
+    if not free:
+        return set()
+    in_run = {ctx["tests"][t]["id"].rsplit("::", 1)[0] for t in run}
+    run = set(run)
+    return {c for c in free if c in in_run and not (ctx["fixture_need"][c] & run)}
+
+
 def est_cpu_ms(run, ms, ctx):
     """Estimated CPU of running `run` in one child."""
     cost = RUN_OVERHEAD_MS
@@ -637,8 +663,9 @@ def est_cpu_ms(run, ms, ctx):
         else:
             cost += ms[t] * RHO
         classes.add(tests[t]["id"].rsplit("::", 1)[0])
+    skip = fixtures_to_skip(run, ctx)
     for c in classes:
-        cost += FIXTURE_MS.get(c, 0) + (HEAVY_IMPORT_MS if c.split("::")[0] in heavy else 0)
+        cost += (0 if c in skip else FIXTURE_MS.get(c, 0)) + (HEAVY_IMPORT_MS if c.split("::")[0] in heavy else 0)
     return cost + (POOL_MS if pooled else 0)
 
 
@@ -668,7 +695,8 @@ def plan_run(sel, ms, ctx):
     gated expensive tests are dropped too."""
     never, gated, run_ms = ctx["never"], ctx["gated"], ctx["run_ms"]
     # unit-restricted tests first (they free the most for what they cost), then cheapest first
-    order = sorted((t for t in sel if t not in never), key=lambda t: (run_ms[t] == ms[t], run_ms[t], t))
+    looped = ctx.get("loops", ())
+    order = sorted((t for t in sel if t not in never), key=lambda t: (t not in looped, run_ms[t], t))
     kept = [t for t in sel if t in never]
     if LABEL:
         if sum(ms[t] for t in order) > LABEL_MAX_MS:
@@ -685,7 +713,7 @@ def plan_run(sel, ms, ctx):
     best, best_gain, best_gate = 0, 0, False
     step = max(1, len(order) // 40)
     for k in range(1, len(order) + 1):
-        if k < len(order) and run_ms[order[k - 1]] == ms[order[k - 1]] and (
+        if k < len(order) and order[k - 1] not in looped and (
             run_ms[order[k]] == run_ms[order[k - 1]] or k % step
         ):
             continue  # (prefixes ending in a unit-restricted test are always considered)
@@ -844,7 +872,7 @@ def heavy_ready(ctx):
     return state["ok"]
 
 
-def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
+def decide(cid, patch_text, sel, units_hit, fixtures_hit, ms, ctx, deadline):
     """Tests that still have to be run by the workers, starting from the static selection."""
     import time
 
@@ -886,6 +914,9 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
     # on those units alone: its cost here is that share of its recorded time.
     ctx = dict(ctx)
     ctx["run_ms"] = run_ms = dict(ms)
+    ctx["fixture_free"] = set()
+    if SKIP_FIXTURES and len(sel) < len(ms):
+        ctx["fixture_free"] = {c for c in ctx["fixture_need"] if c not in fixtures_hit}
     loops = {}
     for t, hit in units_hit.items():
         spec = ctx["units"].get(t)
@@ -897,7 +928,14 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
             if share < LOOP_MAX_MS and (len(set(hit)) < len(spec["units"]) or ms[t] >= EXPENSIVE_MS):
                 run_ms[t] = min(share, ms[t])
                 loops[t] = (spec, sorted(set(hit)))
-    ctx["never"] = never = {t for t in ctx["never"] if t not in loops}
+    cheaper = set()
+    # expensive tests measured to cost less CPU here than their recorded seconds can be run
+    for t, cpu in ctx["cost"].items():
+        if t in sel and t not in loops and cpu < ms[t]:
+            run_ms[t] = round(cpu / RHO)
+            cheaper.add(t)
+    ctx["loops"] = set(loops)
+    ctx["never"] = never = {t for t in ctx["never"] if t not in loops and t not in cheaper}
     if any(test_by_num[t]["file"] in preload["heavy"] for t in sel) and not heavy_ready(ctx):
         # duckdb/pandas cannot be loaded here: leave the tests that need them to the workers
         ctx["never"] = never = never | {t for t in sel if test_by_num[t]["file"] in preload["heavy"]}
@@ -907,27 +945,54 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
         run, gate = plan_run(sel, ms, ctx)
     if not run and not probe:
         return sel
-    # group by class so that class fixtures run once, cheapest class first
+    # Order: one class at a time (its fixture is built once). Classes whose tests are named
+    # after the edited file go first, then classes holding unit-restricted tests, then the
+    # cheapest; a change that breaks something is then usually caught by its first tests.
+    stems = set()
+    for rel in files:
+        parts = rel[:-3].split("/")
+        stems.add(parts[-1].lower())
+        if len(parts) > 2:
+            stems.add(parts[-2].rstrip("s").lower())
+
+    def affinity(t):
+        f, c, m = test_by_num[t]["id"].lower().split("::")
+        best = 0
+        for i, stem in enumerate(sorted(stems, key=len, reverse=True)):
+            if len(stem) < 3:
+                continue
+            if stem in m:
+                best = max(best, 3)
+            elif stem in f.rsplit("/", 1)[-1]:
+                best = max(best, 2)
+            elif stem in f:
+                best = max(best, 1)
+        return best
+
     groups = {}
     for t in run:
         f, c, m = test_by_num[t]["id"].split("::")
         groups.setdefault((f, c), []).append(t)
-    run = [t for g in sorted(groups.values(), key=lambda g: (sum(run_ms[x] for x in g), g)) for t in g]
+    ordered = []
+    for g in groups.values():
+        g.sort(key=lambda t: (t not in loops, -affinity(t), run_ms[t], t))
+        ordered.append((-max(affinity(t) for t in g), not any(t in loops for t in g), sum(run_ms[x] for x in g), g))
+    ordered.sort(key=lambda x: x[:3])
+    run = [t for x in ordered for t in x[3]]
     if LABEL:
         run = [t for t in run if t not in never] + sorted((t for t in run if t in never), key=lambda t: ms[t])
-    # unit-restricted tests go first (they settle the most expensive tests), followed by the
-    # rest of their own class so that its fixture is built once
-    first = [t for t in run if t in loops]
-    first_cls = {test_by_num[t]["id"].rsplit("::", 1)[0] for t in first}
-    same = [t for t in run if t not in loops and test_by_num[t]["id"].rsplit("::", 1)[0] in first_cls]
-    run = first + same + [t for t in run if t not in loops and t not in set(same)]
     order = [tuple(test_by_num[t]["id"].split("::")) + loops.get(t, (None, None)) for t in run]
+    t1 = time.monotonic()
     passed, failed = set(), set()
     state = {"rest": sum(run_ms[t] for t in run)}
     run_set = set(run)
 
     def on_result(i, bad):
         t = run[i]
+        if TIMES:
+            now = time.monotonic()
+            print("T %s %.3f %s" % (cid, now - state.get("last", t1), test_by_num[t]["id"].split("::", 1)[1]), file=sys.stderr)
+            state["last"] = now
         state["rest"] -= run_ms[t]
         (failed if bad else passed).add(t)
         if LABEL:  # stop at the first cheap failure; run every expensive test once reached
@@ -942,7 +1007,9 @@ def decide(cid, patch_text, sel, units_hit, ms, ctx, deadline):
     t1 = time.monotonic()
     c1 = os.times()
     u1 = cpu_now_ms()
-    done, probed = run_tests(cid, files, order, [run_ms[t] for t in run], on_result, deadline, probe)
+    done, probed = run_tests(
+        cid, files, order, [run_ms[t] for t in run], on_result, deadline, probe, fixtures_to_skip(run, ctx)
+    )
     if done and run and len(passed) + len(failed) == len(run):
         ctx["cal"]["act"] += cpu_now_ms() - u1
         ctx["cal"]["est"] += est_cpu_ms(run, ms, ctx)
@@ -981,7 +1048,7 @@ def main():
     all_idx = range(len(ids))
     cdir = os.path.join(DATA, "commits")
     names = sorted(n for n in os.listdir(cdir) if n.endswith(".patch"))
-    static, texts, units_hit = {}, {}, {}
+    static, texts, units_hit, fixtures_hit = {}, {}, {}, {}
     all_idx = [i for i in all_idx if ids[i] in number]
     for name in names:
         try:
@@ -990,7 +1057,9 @@ def main():
             sel = select(texts[name], fixtures, all_idx)
             static[name] = sorted(number[ids[i]] for i in sel if ids[i] in number)
             for i in sel:  # units of a looping test: "<test id>[<unit>]"
-                if ids[i] not in number and ids[i].endswith("]"):
+                if ids[i].endswith("[fixture]"):
+                    fixtures_hit.setdefault(name, set()).add(ids[i][:-9])
+                elif ids[i] not in number and ids[i].endswith("]"):
                     parent, unit = ids[i][:-1].split("[", 1)
                     if parent in number:
                         units_hit.setdefault(name, {}).setdefault(number[parent], []).append(unit)
@@ -1014,6 +1083,18 @@ def main():
                     pool = {number[i] for i in json.load(f)["pool"] if i in number}
                 with open(os.path.join(MAP, "units.json")) as f:
                     units = {number[k]: v for k, v in json.load(f).items() if k in number}
+                try:
+                    with open(os.path.join(MAP, "fixture_use.json")) as f:
+                        fixture_need = {c: {number[t] for t in v if t in number} for c, v in json.load(f).items()}
+                except OSError:
+                    fixture_need = {}
+                if not any(i.endswith("[fixture]") for i in ids):
+                    fixture_need = {}
+                try:
+                    with open(os.path.join(MAP, "cost.json")) as f:
+                        cost = {number[k]: v for k, v in json.load(f).items() if k in number}
+                except OSError:
+                    cost = {}
 
                 def importers(rel):
                     m = load_file(rel)
@@ -1024,7 +1105,7 @@ def main():
 
                 ctx = {
                     "preload": preload, "pool": pool, "tests": test_by_num, "importers": importers,
-                    "units": units, "run_ms": ms, "heavy_state": {}, "readers": readers, "cal": {"act": 4000.0, "est": 4000.0},
+                    "units": units, "run_ms": ms, "heavy_state": {}, "readers": readers, "fixture_need": fixture_need, "cost": cost, "cal": {"act": 4000.0, "est": 4000.0},
                     "never": {t for t in ms if ms[t] >= EXPENSIVE_MS},
                     "gated": {number[i] for i in GATED if i in number},
                 }
@@ -1034,7 +1115,8 @@ def main():
                     except Exception:
                         pass
             final[name] = decide(
-                name[:-6], texts[name], static[name], units_hit.get(name, {}), ms, ctx, deadline
+                name[:-6], texts[name], static[name], units_hit.get(name, {}), fixtures_hit.get(name, ()),
+                ms, ctx, deadline
             )
         except Exception as e:
             print(f"{name}: run failed: {e!r}", file=sys.stderr)
