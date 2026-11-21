@@ -3,23 +3,84 @@
 Picks, for each patch against sqlglot at `eb11aec4be8cb2122afe713a4816662c3f0fb2fa`, the tests
 that can observe the change, and splits them across workers.
 
-## How it works
+Nothing here knows any patch, or any kind of edit, ahead of time. An answer comes from three
+things only: the diff, maps built from the pinned commit, and actually running sqlglot's own
+tests on the patched code while deciding.
+
+## 1. Static selection (maps of the pinned commit)
 
 `map/` is built once from the pinned commit only (`tools/`):
 
 - every test is run alone in its own process and the lines it executes are recorded, so each
-  source line maps to the tests that run it (module- and class-level lines map to the tests
-  that import the module);
+  source line maps to the tests that run it; module-level lines map to the tests that import
+  the module, class-level lines to the tests that use the class;
 - the non-Python files under `tests/` that each test opens are recorded, so a fixture maps
-  to the tests that read it.
+  to the tests that read it;
+- which tests hand work to a process pool (`procs.json`), which library modules the
+  test files import (`preload.json`), and which tests loop over independent units
+  (`units.json`).
 
-At run time `selector.py` parses each diff, maps its changed lines through those maps
-(a changed line stands for its whole statement; a function signature stands for its body;
-an inserted line stands for its neighbours), and balances the selected tests over the number
-of workers that minimises busiest-worker time plus the per-worker charge.
+`selector.py` parses each diff and maps its changed lines through those maps (a changed line
+stands for its whole statement; a function signature stands for its body; an inserted line
+stands for its neighbours). That gives the covering tests: a superset of what can fail.
 
-There is no table from patches or kinds of edit to tests: the output depends only on the
-diff's line numbers and the coverage maps.
+## 2. Run to decide (executing the patched code)
+
+The image contains the pinned sqlglot checkout and the packages of `requirements.lock`.
+For a patch that edits files under `sqlglot/` or `tests/` in place, the selector
+
+1. applies the diff in memory and builds a throw-away copy of the checkout in `/tmp` made of
+   symlinks, with only the patched files real;
+2. forks a child that imports sqlglot fresh from that copy and runs covering tests with
+   `unittest`, exactly as the suite defines them (`SKIP_INTEGRATION=0`, class fixtures,
+   subtests; a failed subtest fails its test), cheapest first, reporting each result back
+   over a pipe;
+3. removes from the answer every test that was run and passed.
+
+Which tests are run is a cost decision: CPU time is charged, so a test is run only when the
+CPU it is expected to cost is clearly less than what leaving it out of the answer saves.
+Tests that are not run stay in the answer. A run stops at the first failure unless
+finishing is cheaper than what it can still save. Tests recorded at 3.6 s or more are never
+run here (except unit-restricted, below).
+
+### Tests that loop over units
+
+`TestGenerator::test_generator_memory` (6.7 s) runs the same body once per dialect, each in
+its own subtest. `map/units.json` names the Enum it loops over, and the coverage map holds
+one extra trace per dialect (the test run with the loop restricted to that dialect, on the
+pinned commit). When a change is covered by the test only through some dialects, the child
+runs the test's own code with the loop restricted to those dialects, which costs that share
+of its time; if they pass, the test is dropped like any other test that was run and passed.
+
+### Evidence rule for the TPC executor tests
+
+`TestExecutor::test_execute_tpcds` (21 s) and `test_execute_tpch` (4 s) replay whole TPC
+query sets through parser, optimizer, planner and executor; they cost more CPU to run than
+they cost to keep. When one of them covers the change, the selector may instead run *every
+other* covering test on the patched code (only if that is cheap enough, and only if there
+are at least five). If any of them fails, nothing is dropped beyond the tests that passed.
+If all of them pass, the two TPC executor tests are left out as well.
+
+This rule is a measured bet, not a proof. `tools/README.md` describes the measurement:
+single-line mutants were generated on lines that `test_execute_tpcds` executes
+(executor, planner, optimizer, parser, generator and dialect files), every other covering
+test was run on each mutant, and the TPC test itself was run whenever all of them passed.
+Mutants that break anything were caught by a cheaper covering test almost immediately; in
+none of the mutants where all cheaper covering tests passed did the TPC test fail (counts
+in `tools/README.md`).
+
+Safety nets, all falling back to the static selection or to something larger:
+
+- the patch does not apply exactly, touches other paths, adds/deletes/renames files, or is
+  binary: static selection;
+- the changed block no longer compiles: every test that imports the file;
+- the edit touches a statement executed at import time (module or class level, a `def`
+  header): the child first imports the patched module; if that fails or hangs, every test
+  that imports the file;
+- a class or module fixture fails, the child dies or exceeds its time allowance, or the
+  global time budget is spent: nothing is removed.
+
+The child's stdout and stderr go to `/dev/null`; only the JSON lines reach stdout.
 
 ## Rebuilding the maps
 

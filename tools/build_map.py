@@ -13,7 +13,7 @@ icover = {}  # relpath -> {line: set(testidx)}: lines run at import (module and 
 inst = {}  # "module:Qual.Name" -> tests that instantiated that class or a subclass of it
 opened = {}  # relpath -> set(testidx)
 for n, _ in enumerate(ids):
-    parts = glob.glob(f"{OUT}/{n}.json") + glob.glob(f"{OUT}/{n}.json.*")  # one per process
+    parts = [p for o in OUT.split(",") for p in glob.glob(f"{o}/{n}.json") + glob.glob(f"{o}/{n}.json.*")]  # one per process
     if not parts:
         print("missing", n, file=sys.stderr); continue
     for p in parts:
@@ -117,6 +117,7 @@ for rel in sorted(set(cover) | set(icover)):
             classcache[o] = s
         return classcache[o]
     sets, setidx, line = [], {}, [-1] * (nlines + 2)
+    imp = []  # lines of statements that run when the module is imported (incl. def headers)
     for ln in range(1, nlines + 1):
         sp = span[ln]
         if sp is None:
@@ -126,6 +127,8 @@ for rel in sorted(set(cover) | set(icover)):
         for k in range(sp[0], sp[1] + 1):
             s |= d.get(k, set())
             at_import = at_import or k in di
+        if at_import or isdef[ln]:
+            imp.append(ln)
         if at_import and not isdef[ln]:
             # a module- or class-level statement: no test "runs" it, it shapes what is imported
             s |= class_users(owner[ln]) if owner[ln] and rel.startswith("sqlglot/") else importers
@@ -135,7 +138,7 @@ for rel in sorted(set(cover) | set(icover)):
         line[ln] = setidx[key]
     allt = sorted(importers | (set().union(*d.values()) if d else set()))
     out = DEST + "/files/" + rel.replace("/", "__") + ".json"
-    json.dump({"sets": sets, "line": line, "all": allt, "instr": string_lines(src)}, open(out, "w"), separators=(",", ":"))
+    json.dump({"sets": sets, "line": line, "all": allt, "instr": string_lines(src), "imp": imp}, open(out, "w"), separators=(",", ":"))
     index[rel] = len(allt)
 json.dump({k: sorted(v) for k, v in sorted(opened.items())}, open(DEST + "/fixtures.json", "w"), separators=(",", ":"))
 print(len(index), "python files,", len(opened), "data files", file=sys.stderr)
